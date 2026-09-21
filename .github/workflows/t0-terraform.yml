@@ -1,0 +1,212 @@
+name: 'T0 Terraform (reusable)'
+
+# Reusable Terraform plan/apply workflow for Tier-0 subscription repositories.
+# Captures the proven cimasuite pipeline: self-hosted CAP runner, OIDC auth (no client secret),
+# private module clone via the tier0-modules-reader GitHub App, Windows runner prerequisites
+# (git on PATH, long paths, pre-checkout sanitize), and a parameterized azurerm backend.
+#
+# Call it from a subscription repo, e.g.:
+#   jobs:
+#     terraform:
+#       uses: Jfaggio/tier0-modules/.github/workflows/t0-terraform.yml@v1.0.0
+#       with:
+#         phase: ${{ inputs.phase }}
+#         backend_resource_group: rg-...
+#         backend_storage_account: st...
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      phase:
+        description: 'plan | apply'
+        type: string
+        required: true
+      backend_resource_group:
+        type: string
+        required: true
+      backend_storage_account:
+        type: string
+        required: true
+      backend_container:
+        type: string
+        default: tfstate
+      backend_key:
+        type: string
+        default: terraform.tfstate
+      environment:
+        type: string
+        default: production
+    secrets:
+      AZURE_CLIENT_ID:               { required: true }
+      AZURE_TENANT_ID:               { required: true }
+      AZURE_SUBSCRIPTION_ID:         { required: true }
+      BACKEND_SUBSCRIPTION_ID:       { required: true }
+      TIER0_MODULES_APP_ID:          { required: true }
+      TIER0_MODULES_APP_PRIVATE_KEY: { required: true }
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  terraform:
+    name: 'Terraform ${{ inputs.phase }}'
+    runs-on: ${{ fromJSON(vars.T0_RUNS_ON || '["self-hosted","Windows","CAP"]') }}
+    environment: ${{ inputs.environment }}
+
+    defaults:
+      run:
+        shell: powershell
+        working-directory: terraform
+
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC:        "true"
+      CHECKPOINT_DISABLE:  "1"
+      # DEMO adaptation: the catalogue-reader GitHub App is optional. When TIER0_MODULES_APP_ID is
+      # not set, the two App steps are skipped and terraform init clones the catalogue anonymously,
+      # which works because the demo catalogue is public. The real platform always sets the App.
+      TIER0_APP_CONFIGURED: ${{ secrets.TIER0_MODULES_APP_ID != '' }}
+
+    steps:
+      - name: Sanitize runner state
+        working-directory: ${{ runner.temp }}
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          git config --global core.longpaths true
+          $names = git config --global --name-only --get-regexp 'extraheader|insteadof' 2>$null
+          if ($names) { $names | Where-Object { $_ -match 'Jfaggio' } | ForEach-Object { git config --global --unset-all $_ 2>$null } }
+          $tf = Join-Path $env:GITHUB_WORKSPACE 'terraform\.terraform'
+          if (Test-Path $tf) {
+            cmd /c "rmdir /s /q `"\\?\$tf`"" 2>$null
+            if (Test-Path $tf) { Remove-Item -LiteralPath $tf -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+          Write-Host "sanitized: longpaths on, stale org auth removed, .terraform cleared"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add Terraform and git to PATH
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\ADEX\Terraform"
+          $dir = $null
+          foreach ($c in @("C:\Program Files\Git\cmd","C:\Program Files\Git\bin","C:\Program Files (x86)\Git\cmd","C:\ADEX\Git\cmd")) {
+            if (Test-Path (Join-Path $c 'git.exe')) { $dir = $c; break }
+          }
+          if (-not $dir) {
+            $hit = Get-ChildItem -Path 'C:\ADEX' -Filter git.exe -Recurse -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -notmatch '\\_work\\' } | Select-Object -First 1
+            if ($hit) { $dir = $hit.DirectoryName }
+          }
+          if ($dir) { Add-Content -Path $env:GITHUB_PATH -Value $dir; Write-Host "git added to PATH: $dir" }
+          else { Write-Host "##[warning]git.exe NOT FOUND" }
+          exit 0
+
+      - name: Compose platform values for var.secrets
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The PCS management subscription is a per-hub constant. Copying another hub's value makes
+          # App Insights fail with "resource group ... does not exist" and the diagnostic settings
+          # fail with LinkedAuthorizationFailed. Read on 2026-09-18; add a line when a hub appears.
+          $pcs = @{
+            'westeurope'         = 'a433850d-96d3-4e41-a0ef-c97a8763af9f'
+            'germanywestcentral' = '8d87b735-0f12-419a-9117-57370f29e6c2'
+            'eastus'             = '7fbecf3a-7cc9-436e-8dd3-1ae38dd2ab15'
+            'australiaeast'      = '6ba82d11-f325-493c-9a09-a4263d191a7e'
+            'brazilsouth'        = '85c99631-c8fb-46b4-9a4b-c75a48fdc71f'
+            'centralindia'       = '9fe7a685-a647-4d32-86d1-acf87b1a3e58'
+            'southeastasia'      = '92d28c56-48b0-4e60-875d-b44f6ad9b7b4'
+          }
+          $file = 'context.auto.tfvars.json'
+          if (-not (Test-Path $file)) { throw "terraform/$file not found - var.secrets cannot be composed" }
+          $hub = (Get-Content $file -Raw | ConvertFrom-Json).context.hub
+          if ([string]::IsNullOrWhiteSpace($hub)) { throw "context.hub is empty in terraform/$file" }
+          if (-not $pcs.ContainsKey($hub)) { throw "unknown hub '$hub' - add its PCS management subscription id to t0-terraform.yml, then publish a new catalogue tag" }
+          $map = [ordered]@{
+            TENANT_ID                      = $env:ARM_TENANT_ID
+            SPOKE_SUBSCRIPTION_ID          = $env:ARM_SUBSCRIPTION_ID
+            PCS_MANAGEMENT_SUBSCRIPTION_ID = $pcs[$hub]
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value ("TF_VAR_secrets=" + ($map | ConvertTo-Json -Compress))
+          Write-Host "hub=$hub pcs_management_subscription_id=$($pcs[$hub])"
+
+      - name: Pass application TF_VAR secrets through
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Application values are named repository secrets, one per Terraform variable, rather than
+          # keys bundled into var.secrets. They arrive here through "secrets: inherit" on the caller.
+          #
+          # Two details that are easy to get wrong. GitHub stores secret NAMES uppercase, so a
+          # secret created as TF_VAR_datadog_key comes back as TF_VAR_DATADOG_KEY; Terraform matches
+          # TF_VAR_<name> to the variable name case-sensitively, so the suffix is lowercased here and
+          # the Terraform variable must be lowercase, as HCL convention has it anyway. And the value
+          # is written with a heredoc delimiter, because a key or certificate spanning several lines
+          # would silently truncate in the KEY=VALUE form.
+          $all = $env:ALL_SECRETS | ConvertFrom-Json
+          $passed = @()
+          foreach ($entry in $all.PSObject.Properties) {
+            if ($entry.Name -notlike 'TF_VAR_*') { continue }
+            if ($entry.Name -eq 'TF_VAR_SECRETS') { Write-Host '##[warning]a leftover TF_VAR_SECRETS repository secret was found and IGNORED - it would overwrite the platform map composed above. Delete it: gh secret delete TF_VAR_SECRETS'; continue }
+            $suffix = $entry.Name.Substring(7).ToLowerInvariant()
+            if ([string]::IsNullOrWhiteSpace($suffix)) { continue }
+            $delimiter = 'TFV_' + [Guid]::NewGuid().ToString('N')
+            Add-Content -Path $env:GITHUB_ENV -Value ('TF_VAR_' + $suffix + '<<' + $delimiter)
+            Add-Content -Path $env:GITHUB_ENV -Value $entry.Value
+            Add-Content -Path $env:GITHUB_ENV -Value $delimiter
+            $passed += ('TF_VAR_' + $suffix)
+          }
+          if ($passed.Count -eq 0) { Write-Host 'no application TF_VAR_* secret on this repository' }
+          else { Write-Host ('passed: ' + ($passed -join ', ')) }
+
+
+      - name: Generate Tier0-modules token
+        if: ${{ env.TIER0_APP_CONFIGURED == 'true' }}
+        id: modtoken
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.TIER0_MODULES_APP_ID }}
+          private-key: ${{ secrets.TIER0_MODULES_APP_PRIVATE_KEY }}
+          owner: Jfaggio
+          repositories: tier0-modules
+
+      - name: Configure git for private modules
+        if: ${{ env.TIER0_APP_CONFIGURED == 'true' }}
+        env:
+          MOD_TOKEN: ${{ steps.modtoken.outputs.token }}
+        run: |
+          $stale = git config --global --name-only --get-regexp '^url\..*\.insteadof$' 2>$null
+          if ($stale) { $stale | ForEach-Object { git config --global --unset-all $_ 2>$null } }
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$env:MOD_TOKEN"))
+          git config --global --replace-all http."https://github.com/Jfaggio/tier0-modules.git/".extraheader "AUTHORIZATION: basic $b64"
+          git config --global core.longpaths true
+
+      - name: Terraform version
+        run: terraform version
+
+      - name: Terraform Init
+        run: |
+          terraform init `
+            -backend-config="resource_group_name=${{ inputs.backend_resource_group }}" `
+            -backend-config="storage_account_name=${{ inputs.backend_storage_account }}" `
+            -backend-config="container_name=${{ inputs.backend_container }}" `
+            -backend-config="key=${{ inputs.backend_key }}" `
+            -backend-config="subscription_id=${{ secrets.BACKEND_SUBSCRIPTION_ID }}" `
+            -backend-config="use_azuread_auth=true" `
+            -backend-config="use_oidc=true"
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        if: ${{ inputs.phase == 'plan' }}
+        run: terraform plan -input=false -no-color
+
+      - name: Terraform Apply
+        if: ${{ inputs.phase == 'apply' }}
+        run: terraform apply -input=false -auto-approve -no-color
