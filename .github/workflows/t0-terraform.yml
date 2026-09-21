@@ -165,6 +165,14 @@ jobs:
           else { Write-Host ('passed: ' + ($passed -join ', ')) }
 
 
+      # DEMO adaptation: GitHub-hosted runners do not carry terraform. The CALLER sets the
+      # repository variable T0_SETUP_TERRAFORM=true to install it; CAP runners have it already.
+      - name: Install Terraform (hosted runner)
+        if: ${{ vars.T0_SETUP_TERRAFORM == 'true' }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
       - name: Generate Tier0-modules token
         if: ${{ env.TIER0_APP_CONFIGURED == 'true' }}
         id: modtoken
