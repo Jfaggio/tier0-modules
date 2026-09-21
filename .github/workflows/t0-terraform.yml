@@ -86,6 +86,9 @@ jobs:
             if (Test-Path $tf) { Remove-Item -LiteralPath $tf -Recurse -Force -ErrorAction SilentlyContinue }
           }
           Write-Host "sanitized: longpaths on, stale org auth removed, .terraform cleared"
+          # git config --get-regexp returns 1 when nothing matches and the runner shell exits with
+          # $LASTEXITCODE: on a fresh runner this step would fail. Nothing above may fail the job.
+          $global:LASTEXITCODE = 0; exit 0
 
       - name: Checkout
         uses: actions/checkout@v4
